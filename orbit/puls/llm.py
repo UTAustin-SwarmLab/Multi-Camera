@@ -4,7 +4,7 @@ import os
 
 
 class LLM:
-    def __init__(self, client, save_dir="outputs/1_puls/longvideobench/conversation_history"):
+    def __init__(self, client, save_dir="/nas/mars/experiment_result/orbit/0_llm_conversation_history"):
         """Initialize LLM"""
         self.client = client
         self.history = []
@@ -18,7 +18,7 @@ class LLM:
         self.history.append(user_message)
 
         response = self.client.chat.completions.create(
-            model="o1-mini",
+            model="o4-mini",
             messages=self.history,
             store=False,
         )
