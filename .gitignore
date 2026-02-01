@@ -1,13 +1,3 @@
-# Outputs, Datasets, Logs, etc.
-datasets
-outputs
-output/
-outputs/
-junk/
-datasets/
-logs/
-vendors/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
