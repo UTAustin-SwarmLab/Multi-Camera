@@ -6,15 +6,18 @@ This script extracts relevant information from nuScenes scene graphs to generate
 2. Spatial relationship questions (MCQ): directional relationships between two objects.
 """
 
+import argparse
 import json
 import os
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
 import openai
+
 from waymo.scenegraph.nuscenes_dataloader import NuScenesLidarSegmentationLoader
-import argparse
+
 
 class QASample:
     def __init__(self, scene_token: str, question_type: str, question: str, answer: str, metadata: Dict[str, Any]):
@@ -48,11 +51,12 @@ class QAGenerator:
     Base QA generator with generic utilities for prompts, captions, and GPT calls.
     Specialized QA generators (e.g., SpatialQAGenerator) should extend this.
     """
-    def __init__(self, prompts_dir: Optional[Path] = None, captions_dir: Optional[Path] = None):
-        self.prompts_dir = prompts_dir or (Path(__file__).parent / "prompts")
-        self.captions_dir = captions_dir or Path("/home/hg22723/projects/Multi-Camera/outputs/captions")
-        self.scene_graphs_dir = scene_graphs_dir or Path("/home/hg22723/projects/Multi-Camera/outputs/scene_graphs")
-        self.instance_annotations = instance_annotations_dir or Path("/home/hg22723/projects/Multi-Camera/outputs/instance_annotations")
+    def __init__(self, prompts_dir: Optional[Path] = None, captions_dir: Optional[Path] = None,
+                 scene_graphs_dir: Optional[Path] = None, instance_annotations_dir: Optional[Path] = None):
+        self.prompts_dir = Path(prompts_dir) if prompts_dir else (Path(__file__).parent / "prompts")
+        self.captions_dir = Path(captions_dir) if captions_dir else Path("/home/hg22723/projects/Multi-Camera/outputs/captions")
+        self.scene_graphs_dir = Path(scene_graphs_dir) if scene_graphs_dir else Path("/home/hg22723/projects/Multi-Camera/outputs/scene_graphs")
+        self.instance_annotations_dir = Path(instance_annotations_dir) if instance_annotations_dir else Path("/home/hg22723/projects/Multi-Camera/outputs/instance_annotations")
     
     def gpt(self, prompt: str, api_key: Optional[str] = None, *, model: str = "gpt-4",
             temperature: float = 0.7, max_tokens: int = 500) -> str:
@@ -87,13 +91,58 @@ class QAGenerator:
             captions[item.get('frame_idx')] = item.get('caption', '')
         return captions
 
-    def load_scene_graph(self, scene_token: str) -> Dict[str, Any]:
+    def load_scene_graph(self, scene_token: str) -> Optional[Dict[str, Any]]:
         scene_graph_file = self.scene_graphs_dir / f"{scene_token}/scene_graph.json"
         if not scene_graph_file.exists():
             return None
         with open(scene_graph_file, 'r') as f:
             scene_graph = json.load(f)
-        return scene_graph
+        return self._extract_scene_info_from_dict(scene_graph)
+
+    def _extract_scene_info_from_dict(self, scene_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process raw scene graph dict into format with object_counts, num_frames, etc."""
+        scene_token = scene_data.get('scene_token', '')
+        frames = scene_data.get('frames', [])
+
+        unique_objects = defaultdict(set)
+        for frame in frames:
+            for obj in frame.get('objects', []):
+                obj_id = obj.get('object_id') or obj.get('annotation_token', '')
+                obj_class = obj.get('object_class', 'unknown')
+                if obj_id:
+                    unique_objects[obj_class].add(obj_id)
+
+        object_counts = {obj_class: len(ids) for obj_class, ids in unique_objects.items()}
+        directional_types = {"in_front", "behind", "left", "right"}
+        directional_relationships: List[Dict[str, Any]] = []
+
+        for frame in frames:
+            frame_idx = frame.get('frame_idx')
+            objects = frame.get('objects', [])
+            id_to_class = {
+                (o.get('object_id') or o.get('annotation_token', '')): o.get('object_class', 'unknown')
+                for o in objects
+            }
+            for rel in frame.get('relationships', []) or []:
+                rel_type = rel.get('relationship_type')
+                if rel_type in directional_types:
+                    source_id = rel.get('source_id', '')
+                    target_id = rel.get('target_id', '')
+                    directional_relationships.append({
+                        'frame_idx': frame_idx,
+                        'type': rel_type,
+                        'distance': rel.get('distance'),
+                        'source': {'id': source_id, 'class': id_to_class.get(source_id, 'unknown')},
+                        'target': {'id': target_id, 'class': id_to_class.get(target_id, 'unknown')},
+                    })
+
+        return {
+            'scene_token': scene_token,
+            'num_frames': len(frames),
+            'object_counts': object_counts,
+            'directional_relationships': directional_relationships,
+            'frames': [{'frame_idx': f.get('frame_idx'), 'objects': f.get('objects', [])} for f in frames],
+        }
     
     def load_instance_annotations(self, scene_token: str) -> Dict[str, Any]:
         instance_annotations_file = self.instance_annotations_dir / f"{scene_token}_instance_annotations.json"
@@ -131,8 +180,10 @@ class CountingQAGenerator(QAGenerator):
             )
         return counting_prompt_path.read_text()
     
-    def generate_for_scene(self, scene_token: str, api_key: Optional[str] = None) -> QASample:
+    def generate_for_scene(self, scene_token: str, api_key: Optional[str] = None) -> Optional[QASample]:
         scene_info = self.load_scene_graph(scene_token)
+        if scene_info is None:
+            return None
         counting_prompt = self.load_prompts_from_disk()
         counting_input = self.format_prompt_input(scene_info, counting_prompt)
         counting_question = self.gpt(counting_input, api_key=api_key)
@@ -384,12 +435,15 @@ def process_questions(qa_generator: QAGenerator, scene_tokens: List[str], api_ke
     qa_samples = []
     for scene_token in scene_tokens:
         qa_sample = qa_generator.generate_for_scene(scene_token, api_key=api_key)
-        qa_samples.append(qa_sample)
+        if qa_sample is not None:
+            qa_samples.append(qa_sample)
     return qa_samples
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Process scene graphs and extract information.')
-    parser.add_argument('--prompts_dir', type=str, default="/home/hg22723/projects/Multi-Camera/datasetbuilder/prompts", help='Directory containing prompts')
+    parser.add_argument('--dataroot', type=str, default='/nas/standard_datasets/nuscenes', help='Path to nuScenes dataset root')
+    parser.add_argument('--version', type=str, default='v1.0-trainval', help='nuScenes dataset version (e.g. v1.0-trainval, v1.0-mini)')
+    parser.add_argument('--prompts_dir', type=str, default="/home/hg22723/projects/Multi-Camera/nuscenes/datasetbuilder/prompts", help='Directory containing prompts')
     parser.add_argument('--scene_graphs_dir', type=str, default="/home/hg22723/projects/Multi-Camera/outputs/scene_graphs", help='Directory containing scene graph subdirectories')
     parser.add_argument('--output_dir', type=str, default="/home/hg22723/projects/Multi-Camera/outputs", help='Directory to save extracted information')
     parser.add_argument('--limit', type=int, default=250, help='Maximum number of scenes to process')
