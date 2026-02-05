@@ -40,9 +40,15 @@ def parse_args() -> argparse.Namespace:
         help="Scene token"
     )
     parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Directory containing scene_graphs/, captions/, instance_annotations/. If not set, uses --output-dir."
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
-        help="Output directory for videos"
+        help="Directory where output videos will be written (videos/ subdir will be created here)"
     )
     parser.add_argument(
         "--cameras",
@@ -471,10 +477,11 @@ def main():
     print(f"\nLoading nuScenes from {args.dataroot}...")
     nusc = NuScenes(version=args.version, dataroot=args.dataroot, verbose=False)
     
-    # Load scene graph
-    args.input_json = os.path.join(args.output_dir, f"scene_graphs/{args.scene_token}/scene_graph.json")
-    args.annotations_json = os.path.join(args.output_dir, f"instance_annotations/{args.scene_token}_instance_annotations.json")
-    args.captions_json = os.path.join(args.output_dir, f"captions/{args.scene_token}_captions.json")
+    # Where to read scene graph, annotations, captions from
+    data_dir = args.data_dir if args.data_dir is not None else args.output_dir
+    args.input_json = os.path.join(data_dir, f"scene_graphs/{args.scene_token}/scene_graph.json")
+    args.annotations_json = os.path.join(data_dir, f"instance_annotations/{args.scene_token}_instance_annotations.json")
+    args.captions_json = os.path.join(data_dir, f"captions/{args.scene_token}_captions.json")
     print(f"Loading scene graph from {args.input_json}...")
     scene_graph = load_scene_graph(args.input_json)
     annotations = load_annotations(args.annotations_json)
@@ -484,9 +491,9 @@ def main():
     print(f"Frames: {scene_graph.get('num_frames', 0)}")
     print(f"Annotations: {scene_graph.get('num_annotations', 0)}")
     
-    # Create output directory
+    # Where to write videos (may be different from data_dir)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "videos").mkdir(parents=True, exist_ok=True)
     
     # Get scene name for output filename
     scene_name = scene_graph.get('scene_name', scene_graph.get('scene_token', 'scene'))
