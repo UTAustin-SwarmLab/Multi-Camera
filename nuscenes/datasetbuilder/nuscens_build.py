@@ -235,7 +235,8 @@ class SpatialQAGenerator(QAGenerator):
         for rel in directional:
             frame_idx = rel["frame_idx"]
             frame_objects = frames_meta.get(frame_idx, {}).get("objects", [])
-            num_source_class_in_frame = sum(1 for o in frame_objects if o["class"] == rel["source"]["class"])
+            obj_class = lambda o: o.get("object_class") or o.get("class", "")
+            num_source_class_in_frame = sum(1 for o in frame_objects if obj_class(o) == rel["source"]["class"])
             if num_source_class_in_frame == 1:
                 candidate = rel
                 break
@@ -250,23 +251,21 @@ class SpatialQAGenerator(QAGenerator):
             scene_token=scene_info["scene_token"], num_frames=scene_info["num_frames"], object_counts=object_count_str
         )
 
-    def load_prompts_from_disk(self) -> Tuple[str, str]:
-
+    def load_prompts_from_disk(self) -> str:
         prompts_dir = self.prompts_dir
         spatial_prompt_path = prompts_dir / "spatial_questions.txt"
-        if not counting_prompt_path.exists() or not spatial_prompt_path.exists():
+        if not spatial_prompt_path.exists():
             raise FileNotFoundError(
-                f"Prompt files not found in {prompts_dir}. "
-                "Please ensure counting_questions.txt and spatial_questions.txt exist."
+                f"Prompt file not found in {prompts_dir}. " "Please ensure spatial_questions.txt exists."
             )
-        return counting_prompt_path.read_text(), spatial_prompt_path.read_text()
+        return spatial_prompt_path.read_text()
 
     def build_spatial_input(self, scene_info: Dict[str, Any], spatial_prompt: str) -> str:
         directional = scene_info.get("directional_relationships", [])
         frames_meta = {f["frame_idx"]: f for f in scene_info.get("frames", [])}
         candidate = self._select_candidate(directional, frames_meta)
 
-        captions_map = _load_scene_captions(scene_info["scene_token"]) or {}
+        captions_map = self.load_captions_for_scene(scene_info["scene_token"]) or {}
         frame_idx_for_prompt = candidate["frame_idx"] if candidate else 0
         scene_description = captions_map.get(frame_idx_for_prompt, "")[:600]
 
@@ -277,32 +276,54 @@ class SpatialQAGenerator(QAGenerator):
                 f"- Frame {r['frame_idx']}: {r['source']['class']} is {r['type'].replace('_', ' ')} {r['target']['class']}"
             )
         directional_relationships_str = "\n".join(rel_lines) if rel_lines else "- None"
+        object_counts_str = "\n".join([f"- {cls}: {count}" for cls, count in scene_info["object_counts"].items()])
+        scene_desc = scene_description if scene_description else "A driving scene with various road users."
 
-        return spatial_prompt.format(
-            scene_token=scene_info["scene_token"],
-            frame_idx=frame_idx_for_prompt,
-            scene_description=scene_description if scene_description else "A driving scene with various road users.",
-            directional_relationships=directional_relationships_str,
-            object_counts="\n".join([f"- {cls}: {count}" for cls, count in scene_info["object_counts"].items()]),
+        # Use explicit substitution so JSON examples in the prompt (with { }) are not interpreted by .format()
+        return (
+            spatial_prompt.replace("{scene_token}", scene_info["scene_token"])
+            .replace("{frame_idx}", str(frame_idx_for_prompt))
+            .replace("{scene_description}", scene_desc)
+            .replace("{directional_relationships}", directional_relationships_str)
+            .replace("{object_counts}", object_counts_str)
         )
 
-    def generate_for_scene(
-        self, scene_info: Dict[str, Any], counting_prompt: str, spatial_prompt: str, api_key: Optional[str] = None
-    ) -> Dict[str, Any]:
-        counting_input = self.format_counting_input(scene_info, counting_prompt)
+    def generate_for_scene(self, scene_token: str, api_key: Optional[str] = None) -> Optional[QASample]:
+        scene_info = self.load_scene_graph(scene_token)
+        if scene_info is None:
+            return None
+        spatial_prompt = self.load_prompts_from_disk()
         spatial_input = self.build_spatial_input(scene_info, spatial_prompt)
-        counting_question = self.gpt(counting_input, api_key=api_key)
-        spatial_question = self.gpt(spatial_input, api_key=api_key)
-        return {
-            "scene_token": scene_info["scene_token"],
-            "counting_question": counting_question,
-            "spatial_question": spatial_question,
-            "metadata": {
-                "num_frames": scene_info["num_frames"],
-                "object_counts": scene_info["object_counts"],
-                "num_directional_relationships": len(scene_info.get("directional_relationships") or []),
-            },
+        raw_response = self.gpt(spatial_input, api_key=api_key)
+        # Parse JSON from response (may be wrapped in markdown code blocks)
+        response_text = raw_response.strip()
+        if "```" in response_text:
+            start = response_text.find("{")
+            end = response_text.rfind("}") + 1
+            if start >= 0 and end > start:
+                response_text = response_text[start:end]
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError:
+            parsed = {"question": raw_response[:500], "options": {}, "correct_option": "", "rationale": raw_response}
+        question = parsed.get("question", "")
+        answer = {
+            "options": parsed.get("options", {}),
+            "correct_option": parsed.get("correct_option", ""),
+            "rationale": parsed.get("rationale", ""),
         }
+        metadata = {
+            "num_frames": scene_info["num_frames"],
+            "object_counts": scene_info["object_counts"],
+            "num_directional_relationships": len(scene_info.get("directional_relationships") or []),
+        }
+        return self.construct_qa_sample(
+            scene_token=scene_token,
+            question_type="spatial",
+            question=question,
+            answer=answer,
+            metadata=metadata,
+        )
 
 
 def extract_scene_info(scene_graph: str) -> Dict[str, Any]:
@@ -316,9 +337,9 @@ def extract_scene_info(scene_graph: str) -> Dict[str, Any]:
         - spatial_relationships: List of tuples (obj1, obj2, relationship)
         - scene_token: The scene identifier
     """
-    print(f"Processing {scene_graph_path}...")
+    print(f"Processing {scene_graph}...")
 
-    with open(scene_graph_path, "r") as f:
+    with open(scene_graph, "r") as f:
         # Read file in chunks to handle large files
         first_line = f.readline()
         scene_data = json.loads(first_line + f.read())
@@ -524,7 +545,7 @@ def parse_args():
     parser.add_argument(
         "--question_type",
         type=str,
-        default="counting",
+        default="spatial",
         help="Question type: counting, spatial, temporal, event_ordering, causality, perception, summarization, which_camera",
     )
     parser.add_argument("--api_key", type=str, default=None, help="OpenAI API key")
