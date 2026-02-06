@@ -546,7 +546,7 @@ class SummarizationQAGenerator(QAGenerator):
         summary = self.gpt(
             prompt,
             api_key=api_key,
-            model="gpt-4",
+            model="gpt-4o",
             temperature=0.5,
             max_tokens=300,
             scene_token=scene_token,
