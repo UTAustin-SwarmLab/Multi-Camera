@@ -11,6 +11,9 @@
 # Save videos for each scene.
 python waymo/scenegraph/create_scenegraph_video.py \
   --dataroot /nas/standard_datasets/nuscenes \
-  --scene-token 0c601ff2bf004fccafec366b08bf29e2 \
+  --scene-token 7e3a6bdd6c6f4c8fb018cff404974446 \
   --data-dir "/home/hg22723/projects/Multi-Camera/outputs" \
-  --output-dir "/nas/neurosymbolic/multi-cam-dataset/nuscenes/videos_out"
+  --output-dir "/nas/neurosymbolic/multi-cam-dataset/nuscenes/videos_out" \
+  --panoramic
+
+  # --scene-token 0c601ff2bf004fccafec366b08bf29e2 \

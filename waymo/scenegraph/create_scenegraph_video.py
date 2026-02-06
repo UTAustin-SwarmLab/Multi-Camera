@@ -100,8 +100,24 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Line thickness"
     )
+    parser.add_argument(
+        "--panoramic",
+        action="store_true",
+        help="Export a single video with all camera views stitched in panoramic order (front-left → front → front-right → back-right → back → back-left)"
+    )
     
     return parser.parse_args()
+
+
+# Camera order for panoramic stitch (left-to-right = clockwise around vehicle)
+PANORAMA_CAMERA_ORDER = [
+    "CAM_FRONT_LEFT",
+    "CAM_FRONT",
+    "CAM_FRONT_RIGHT",
+    "CAM_BACK_RIGHT",
+    "CAM_BACK",
+    "CAM_BACK_LEFT",
+]
 
 
 def load_scene_graph(input_json: str) -> Dict:
@@ -300,6 +316,92 @@ def draw_frame_info(
         h -= 15
 
 
+def render_frame_for_camera(
+    nusc: NuScenes,
+    scene_graph: Dict,
+    frame: Dict,
+    frame_idx: int,
+    total_frames: int,
+    camera: str,
+    args: argparse.Namespace,
+    annotations: Dict = None,
+    captions: Dict = None,
+) -> Optional[np.ndarray]:
+    """
+    Render a single frame for one camera: load image, draw boxes/labels, return BGR image.
+    Returns None if the sample/camera/image cannot be loaded.
+    """
+    sample_token = frame["sample_token"]
+    try:
+        sample = nusc.get("sample", sample_token)
+    except Exception:
+        return None
+    if camera not in sample["data"]:
+        return None
+    camera_token = sample["data"][camera]
+    cam_data = nusc.get("sample_data", camera_token)
+    img_path = Path(args.dataroot) / cam_data["filename"]
+    image = cv2.imread(str(img_path))
+    if image is None:
+        return None
+    image = image.copy()
+
+    ego_pose = nusc.get("ego_pose", cam_data["ego_pose_token"])
+    cs_record = nusc.get("calibrated_sensor", cam_data["calibrated_sensor_token"])
+    cam_intrinsic = np.array(cs_record["camera_intrinsic"])
+
+    visible_objects = [
+        obj
+        for obj in frame["objects"]
+        if obj.get("visible_cameras") and camera in obj["visible_cameras"]
+    ]
+
+    for obj in visible_objects:
+        try:
+            box = nusc.get_box(obj["annotation_token"])
+            box.translate(-np.array(ego_pose["translation"]))
+            box.rotate(Quaternion(ego_pose["rotation"]).inverse)
+            box.translate(-np.array(cs_record["translation"]))
+            box.rotate(Quaternion(cs_record["rotation"]).inverse)
+            corners_3d = box.corners()
+            in_front = np.argwhere(corners_3d[2, :] > 0).flatten()
+            corners = corners_3d[:, in_front]
+            corner_coords = view_points(corners, cam_intrinsic, normalize=True).T[:, :2]
+            corners_2d = post_process_coords(corner_coords)
+            if corners_2d is None:
+                continue
+            color = get_object_color(obj["object_class"])
+            if args.show_bbox:
+                draw_3d_box(image, corners_2d, color, args.thickness)
+            if args.show_labels:
+                obj_annotations = annotations.get(obj["object_id"]) if annotations else None
+                draw_object_label(
+                    image,
+                    np.array(corners_2d),
+                    obj,
+                    color,
+                    args.show_properties,
+                    args.font_scale,
+                    args.thickness,
+                    obj_annotations,
+                )
+        except Exception:
+            continue
+
+    caption = captions.get(frame["sample_token"]) if captions else None
+    draw_frame_info(
+        image,
+        camera,
+        frame_idx,
+        total_frames,
+        len(visible_objects),
+        args.font_scale,
+        args.thickness,
+        caption,
+    )
+    return image
+
+
 def create_video_for_camera(
     nusc: NuScenes,
     scene_graph: Dict,
@@ -327,121 +429,113 @@ def create_video_for_camera(
             print(f"  First object keys: {first_frame['objects'][0].keys()}")
             print(f"  Sample first object: {first_frame['objects'][0]}")
     
-    # Initialize video writer
     writer = None
+    total_frames = len(frames)
     
     try:
         for frame_idx, frame in enumerate(tqdm(frames, desc=f"  {camera}")):
-            sample_token = frame['sample_token']
-            
-            try:
-                sample = nusc.get('sample', sample_token)
-            except:
-                print(f"  Warning: Could not load sample {sample_token}")
-                continue
-            
-            # Check if camera exists in this sample
-            if camera not in sample['data']:
-                continue
-            
-            camera_token = sample['data'][camera]
-            cam_data = nusc.get('sample_data', camera_token)
-            img_path = Path(args.dataroot) / cam_data['filename']
-            
-            # Load image
-            image = cv2.imread(str(img_path))
+            image = render_frame_for_camera(
+                nusc, scene_graph, frame, frame_idx, total_frames,
+                camera, args, annotations, captions
+            )
             if image is None:
-                print(f"  Warning: Could not load image {img_path}")
                 continue
-            
-            # Initialize writer with first valid frame
             if writer is None:
                 h, w = image.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(output_path, fourcc, args.fps, (w, h))
-            
-            # Get ego pose for this frame (global → ego transformation)
-            ego_pose_token = cam_data['ego_pose_token']
-            ego_pose = nusc.get('ego_pose', ego_pose_token)
-            # ego_translation = np.array(ego_pose['translation'])
-            # ego_rotation = Quaternion(ego_pose['rotation'])
-            
-            # Get camera intrinsics and extrinsics (ego → camera transformation)
-            cs_record = nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
-            cam_intrinsic = np.array(cs_record['camera_intrinsic'])
-            cam_translation = np.array(cs_record['translation'])
-            cam_rotation = Quaternion(cs_record['rotation'])
-            
-            # Filter objects visible in this camera from scene graph
-            visible_objects = []
-            for obj in frame['objects']:
-                if obj.get('visible_cameras') and camera in obj['visible_cameras']:
-                    visible_objects.append(obj)
-            
-            # Debug output for first frame
-            if frame_idx == 0:
-                print(f"\n  Frame 0: Total objects = {len(frame['objects'])}, Visible in {camera} = {len(visible_objects)}")
-            
-            # Draw each object using data directly from scene graph
-            for obj in visible_objects:
-                try:
-                    box = nusc.get_box(obj['annotation_token'])
-                    corners = box.corners()
-                    box.translate(-np.array(ego_pose['translation']))
-                    box.rotate(Quaternion(ego_pose['rotation']).inverse)
-                    box.translate(-np.array(cs_record['translation']))
-                    box.rotate(Quaternion(cs_record['rotation']).inverse)
-                    corners_3d = box.corners()
-                    
-                    # Check if box is in front of camera
-                    # if not np.any(corners_3d[2, :] > 0):
-                    print("corners_3d", corners_3d)
-                    in_front = np.argwhere(corners_3d[2, :] > 0).flatten()
-                    corners = corners_3d[:, in_front]
-                    # Project 3D corners to 2D image plane
-                    print("corners", corners)
-                    corner_coords = view_points(corners, cam_intrinsic, normalize=True).T[:, :2]
-                    
-                    corners_2d = post_process_coords(corner_coords)
-                    print("corners_2d", corners_2d)
-                    # Get color for this object class
-                    color = get_object_color(obj['object_class'])
-                    
-                    # Draw bounding box
-                    if args.show_bbox:
-                        draw_3d_box(image, corners_2d, color, args.thickness)
-                    
-                    # Draw label
-                    if args.show_labels:
-                        draw_object_label(
-                            image, corners_2d, obj, color,
-                            args.show_properties, args.font_scale, args.thickness, annotations[obj['object_id']]
-                        )
-                    
-                except Exception as e:
-                    # Skip objects that can't be drawn
-                    traceback.print_exc()
-                    continue
-            
-            # Draw frame info
-            if captions is not None:
-                caption = captions[frame['sample_token']]
-            else:
-                caption = None
-            draw_frame_info(
-                image, camera, frame_idx, len(frames),
-                len(visible_objects), args.font_scale, args.thickness, caption
-            )
-            
-            # Write frame
             writer.write(image)
-    
     finally:
         if writer is not None:
             writer.release()
             print(f"  Saved: {output_path}")
         else:
             print(f"  No frames written for {camera}")
+
+
+def _panorama_camera_list(requested: List[str]) -> List[str]:
+    """Return requested cameras in panoramic order (front-left → … → back-left)."""
+    ordered = [c for c in PANORAMA_CAMERA_ORDER if c in requested]
+    # Add any requested cameras not in the default order at the end
+    for c in requested:
+        if c not in ordered:
+            ordered.append(c)
+    return ordered
+
+
+def create_panoramic_video(
+    nusc: NuScenes,
+    scene_graph: Dict,
+    output_path: str,
+    args: argparse.Namespace,
+    annotations: Dict = None,
+    captions: Dict = None,
+):
+    """Create a single video with all camera views stitched in panoramic order."""
+    frames = scene_graph["frames"]
+    if not frames:
+        print("  No frames found in scene graph")
+        return
+
+    cameras = _panorama_camera_list(args.cameras)
+    print(f"\nCreating panoramic video with cameras (left→right): {cameras}")
+
+    writer = None
+    total_frames = len(frames)
+    target_height = 400  # uniform height for panorama strip
+
+    try:
+        for frame_idx, frame in enumerate(tqdm(frames, desc="  Panorama")):
+            tiles = []
+            for camera in cameras:
+                img = render_frame_for_camera(
+                    nusc,
+                    scene_graph,
+                    frame,
+                    frame_idx,
+                    total_frames,
+                    camera,
+                    args,
+                    annotations,
+                    captions,
+                )
+                if img is None:
+                    # Placeholder so layout stays fixed
+                    img = np.zeros((target_height, 320, 3), dtype=np.uint8)
+                    img[:] = (40, 40, 40)
+                    cv2.putText(
+                        img,
+                        camera,
+                        (20, target_height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (180, 180, 180),
+                        2,
+                    )
+                else:
+                    h, w = img.shape[:2]
+                    scale = target_height / h
+                    new_w = int(round(w * scale))
+                    img = cv2.resize(img, (new_w, target_height), interpolation=cv2.INTER_AREA)
+                tiles.append(img)
+            stitched = np.concatenate(tiles, axis=1)
+
+            if writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(
+                    output_path,
+                    fourcc,
+                    args.fps,
+                    (stitched.shape[1], stitched.shape[0]),
+                )
+            writer.write(stitched)
+    finally:
+        if writer is not None:
+            writer.release()
+            print(f"  Saved: {output_path}")
+        else:
+            print("  No frames written for panoramic video")
+
 
 def load_annotations(annotations_json: str) -> Dict:
     """Load annotations from JSON file."""
@@ -498,24 +592,44 @@ def main():
     # Get scene name for output filename
     scene_name = scene_graph.get('scene_name', scene_graph.get('scene_token', 'scene'))
     
-    # Create video for each camera
-    for camera in args.cameras:
-        output_path = output_dir / "videos" / f"{scene_name}_{camera}.mp4"
-        
+    # When panoramic, default to all 6 cameras in spatial order
+    if args.panoramic and args.cameras == ["CAM_FRONT"]:
+        args.cameras = list(PANORAMA_CAMERA_ORDER)
+    
+    if args.panoramic:
+        # Single stitched panoramic video (all requested cameras in spatial order)
+        output_path = output_dir / "videos" / f"{scene_name}_panoramic.mp4"
         try:
-            create_video_for_camera(
+            create_panoramic_video(
                 nusc=nusc,
                 scene_graph=scene_graph,
-                camera=camera,
                 output_path=str(output_path),
                 args=args,
                 annotations=annotations,
-                captions=captions
+                captions=captions,
             )
         except Exception as e:
-            print(f"\nError creating video for {camera}: {e}")
+            print(f"\nError creating panoramic video: {e}")
             import traceback
             traceback.print_exc()
+    else:
+        # Create video for each camera
+        for camera in args.cameras:
+            output_path = output_dir / "videos" / f"{scene_name}_{camera}.mp4"
+            try:
+                create_video_for_camera(
+                    nusc=nusc,
+                    scene_graph=scene_graph,
+                    camera=camera,
+                    output_path=str(output_path),
+                    args=args,
+                    annotations=annotations,
+                    captions=captions
+                )
+            except Exception as e:
+                print(f"\nError creating video for {camera}: {e}")
+                import traceback
+                traceback.print_exc()
     
     print("\n" + "="*60)
     print("✓ Video creation complete!")
